@@ -280,6 +280,21 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     new_config.vocab_size = 1
     new_config.pad_token_id = 0
 
+    # Nemotron-H specific config shrinking for hybrid architecture
+    if getattr(config, "model_type", "") == "nemotron_h":
+        _set_config_attrs(new_config, {
+            "mamba_num_heads": 1,
+            "mamba_head_dim": 1,
+            "ssm_state_size": 1,
+            "n_groups": 1,
+            "conv_kernel": 2,
+            "n_routed_experts": 1,
+            "moe_intermediate_size": 1,
+            "moe_shared_expert_intermediate_size": 1,
+        })
+        if getattr(new_config, "moe_latent_size", None) is not None:
+            new_config.moe_latent_size = 1
+
     # Set attention module head_dim
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     new_config.update({"head_dim" : head_dim})
@@ -400,7 +415,11 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
 
 @torch.inference_mode
 def set_additional_modules(new_model, quant_state_dict, config):
-    if hasattr(new_model, "language_model"):
+    model_type = getattr(config, "model_type", "")
+    if model_type == "nemotron_h":
+        language_model_prefix = "model"
+        language_model = new_model.backbone
+    elif hasattr(new_model, "language_model"):
         language_model = new_model.language_model
         language_model_prefix = "model.language_model"
     else:
@@ -408,7 +427,10 @@ def set_additional_modules(new_model, quant_state_dict, config):
         language_model = new_model.model
 
     # Embeddings
-    embed_tokens_key = f"{language_model_prefix}.embed_tokens.weight"
+    if model_type == "nemotron_h":
+        embed_tokens_key = f"{language_model_prefix}.embeddings.weight"
+    else:
+        embed_tokens_key = f"{language_model_prefix}.embed_tokens.weight"
     # Use explicit None check since pad_token_id=0 is valid (0 is falsy in Python)
     pad_token_id = getattr(config, "pad_token_id", None)
     if pad_token_id is None:
@@ -435,24 +457,36 @@ def set_additional_modules(new_model, quant_state_dict, config):
         module.num_embeddings = num_embeddings
         module.embedding_dim = embedding_dim
 
-    set_embedding(language_model.embed_tokens, embed_tokens_key, pad_token_id) # This sets the embedding that we generally find in language (sub)model
+    if model_type == "nemotron_h":
+        set_embedding(language_model.embeddings, embed_tokens_key, pad_token_id)
+    else:
+        set_embedding(language_model.embed_tokens, embed_tokens_key, pad_token_id) # This sets the embedding that we generally find in language (sub)model
 
     if 'model.visual.pos_embed.weight' in quant_state_dict:
         # This is to handle visual embeddings in Qwen 3 VL
         set_embedding(new_model.model.visual.pos_embed, 'model.visual.pos_embed.weight', None, requires_grad=False)
 
     # Norm
-    norm_key = f"{language_model_prefix}.norm.weight"
-    norm = quant_state_dict[norm_key]
-    norm = torch.nn.Parameter(norm, requires_grad = False)
-    language_model.norm.weight = norm
+    if model_type == "nemotron_h":
+        norm_key = f"{language_model_prefix}.norm_f.weight"
+        norm = quant_state_dict[norm_key]
+        norm = torch.nn.Parameter(norm, requires_grad = False)
+        language_model.norm_f.weight = norm
+    else:
+        norm_key = f"{language_model_prefix}.norm.weight"
+        norm = quant_state_dict[norm_key]
+        norm = torch.nn.Parameter(norm, requires_grad = False)
+        language_model.norm.weight = norm
 
     # LM Head. Do note that for some models, like Mistral3ForConditionalGeneration,
     # there can be mismatch in the value of tie_word_embeddings between config and text_config
     # we prefer picking the one in text_config. If you notice any issue later, please report it!
     text_config = getattr(config, "text_config", config)
     if getattr(text_config, "tie_word_embeddings", False):
-        lmhead_key = f"{language_model_prefix}.embed_tokens.weight"
+        if model_type == "nemotron_h":
+            lmhead_key = f"{language_model_prefix}.embeddings.weight"
+        else:
+            lmhead_key = f"{language_model_prefix}.embed_tokens.weight"
     else:
         lmhead_key = "lm_head.weight"
 
@@ -539,6 +573,30 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.mlp.up_proj",
             "model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.layers.{kk}.mlp.down_proj",
+
+            # Nemotron-H mixer-based layers (attention)
+            "model.layers.{kk}.mixer.q_proj",
+            "model.layers.{kk}.mixer.k_proj",
+            "model.layers.{kk}.mixer.v_proj",
+            "model.layers.{kk}.mixer.o_proj",
+            # Nemotron-H mixer-based layers (MLP, no gate_proj)
+            "model.layers.{kk}.mixer.up_proj",
+            "model.layers.{kk}.mixer.down_proj",
+            # Nemotron-H mixer-based layers (Mamba)
+            "model.layers.{kk}.mixer.in_proj",
+            "model.layers.{kk}.mixer.conv1d",
+            "model.layers.{kk}.mixer.out_proj",
+            "model.layers.{kk}.mixer.A_log",
+            "model.layers.{kk}.mixer.D",
+            "model.layers.{kk}.mixer.dt_bias",
+            # Nemotron-H mixer-based layers (MoE)
+            "model.layers.{kk}.mixer.gate",
+            "model.layers.{kk}.mixer.experts.up_proj",
+            "model.layers.{kk}.mixer.experts.down_proj",
+            "model.layers.{kk}.mixer.shared_experts.up_proj",
+            "model.layers.{kk}.mixer.shared_experts.down_proj",
+            "model.layers.{kk}.mixer.fc1_latent_proj",
+            "model.layers.{kk}.mixer.fc2_latent_proj",
         },
         'layernorms': {
             "model.language_model.layers.{kk}.input_layernorm",
@@ -567,6 +625,10 @@ def get_model_layer_config(return_non_layered=True):
 
             # qwen3 vl
             "model.visual.deepstack_merger_list.{kk}.norm",
+
+            # Nemotron-H
+            "model.layers.{kk}.norm",
+            "model.layers.{kk}.mixer.norm",
         },
         'vision_layers': {
 

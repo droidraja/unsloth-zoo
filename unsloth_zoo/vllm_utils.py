@@ -43,6 +43,7 @@ import os
 import ast
 import sys
 import shutil
+import tempfile
 import torch
 from torch import __version__ as torch_version
 import json
@@ -104,6 +105,35 @@ def get_mem_info():
     else:
         free_memory, total_memory = torch.cuda.mem_get_info()
     return free_memory, total_memory
+pass
+
+def _maybe_create_vllm_tokenizer_override(model_name, token = None, revision = None, trust_remote_code = True):
+    """Build a tokenizer directory that bypasses unsupported tokenizer_class metadata."""
+    try:
+        from transformers import PreTrainedTokenizerFast
+
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(
+            model_name,
+            token = token,
+            revision = revision,
+            trust_remote_code = trust_remote_code,
+        )
+        temp_dir = tempfile.mkdtemp(prefix = "unsloth_vllm_tokenizer_")
+        tokenizer.save_pretrained(temp_dir)
+
+        tokenizer_config_path = os.path.join(temp_dir, "tokenizer_config.json")
+        if os.path.exists(tokenizer_config_path):
+            try:
+                with open(tokenizer_config_path, "r", encoding = "utf-8") as f:
+                    tokenizer_config = json.load(f)
+                tokenizer_config["tokenizer_class"] = type(tokenizer).__name__
+                with open(tokenizer_config_path, "w", encoding = "utf-8") as f:
+                    json.dump(tokenizer_config, f, indent = 2, ensure_ascii = False)
+            except Exception:
+                pass
+        return temp_dir
+    except Exception:
+        return None
 pass
 
 if importlib.util.find_spec("vllm") is not None:
@@ -901,6 +931,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
     # Determine model type from config BEFORE reassigning config
     model_type = getattr(config, "model_type", "causal_lm")
+    is_nemotron_h = (model_type == "nemotron_h")
 
     # Keep the original config for model_type but use text_config for vocab_size etc
     text_config = getattr(config, "text_config", config)
@@ -1078,6 +1109,14 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     # Use get_state_dict for consistent extraction and automatic truncation
     get_state_dict(f"{vllm_text_model_prefix}.embed_tokens", 0, state_dict, embed_tokens, slice_weights=False)
 
+    # Nemotron-H: HF uses 'embeddings' not 'embed_tokens'
+    if is_nemotron_h:
+        old_emb_key = f"{vllm_text_model_prefix}.embed_tokens.weight"
+        new_emb_key = f"{vllm_text_model_prefix}.embeddings.weight"
+        if old_emb_key in state_dict:
+            state_dict[new_emb_key] = state_dict.pop(old_emb_key)
+            quant_state_dict[new_emb_key] = quant_state_dict.pop(old_emb_key)
+
     # Get layer configuration for this model type
     layer_config = get_model_layer_config()
 
@@ -1091,63 +1130,146 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
     # All layers
     skipped_layernorms = []
-    for kk in range(len(vllm_text_model.layers)):
-        layer = vllm_text_model.layers[kk]
-        if hasattr(layer, "self_attn"):
-            prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
-            qkv_proj = layer.self_attn.qkv_proj
-            o_proj = layer.self_attn.o_proj
 
-            use_fused_qkv = _is_fused_module("qkv_proj")
-            if use_fused_qkv:
-                # For some model types like phi3 vllm will expect fused qkv (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
+    if is_nemotron_h:
+        # Nemotron-H has hybrid layers (Mamba/Attention/MLP/MoE) using unified 'mixer' attribute
+        hybrid_pattern = getattr(text_config, "hybrid_override_pattern", None)
+        if hybrid_pattern is None:
+            layers_block_type = getattr(text_config, "layers_block_type", [])
+            _type_map = {"mamba": "M", "attention": "*", "mlp": "-", "moe": "E"}
+            hybrid_pattern = "".join(_type_map.get(t, t) for t in layers_block_type)
+
+        for kk in range(len(vllm_text_model.layers)):
+            layer = vllm_text_model.layers[kk]
+            layer_type = hybrid_pattern[kk]
+            mixer_prefix = f"{vllm_text_model_prefix}.layers.{kk}.mixer"
+
+            if layer_type == "*":  # Attention layer
+                qkv_proj = layer.mixer.qkv_proj
+                get_state_dict(f"{mixer_prefix}.q_proj", 0, state_dict, qkv_proj)
+                get_state_dict(f"{mixer_prefix}.k_proj", 1, state_dict, qkv_proj)
+                get_state_dict(f"{mixer_prefix}.v_proj", 2, state_dict, qkv_proj)
+                get_state_dict(f"{mixer_prefix}.o_proj", 0, state_dict, layer.mixer.o_proj)
+
+            elif layer_type == "M":  # Mamba layer
+                get_state_dict(f"{mixer_prefix}.in_proj", 0, state_dict, layer.mixer.in_proj, slice_weights=False)
+                get_state_dict(f"{mixer_prefix}.conv1d", 0, state_dict, layer.mixer.conv1d, slice_weights=False)
+                get_state_dict(f"{mixer_prefix}.out_proj", 0, state_dict, layer.mixer.out_proj)
+
+                # Bare parameters: A (vLLM) -> A_log (HF), D, dt_bias
+                # vLLM renames A_log -> A during loading but the values are the same
+                for vllm_name, hf_name in [("A", "A_log"), ("D", "D"), ("dt_bias", "dt_bias")]:
+                    param = getattr(layer.mixer, vllm_name)
+                    state_dict[f"{mixer_prefix}.{hf_name}"] = param.data
+                    quant_state_dict[f"{mixer_prefix}.{hf_name}"] = param.data
+
+                # Mamba internal gated RMSNorm
+                if hasattr(layer.mixer, "norm") and hasattr(layer.mixer.norm, "weight") and layer.mixer.norm.weight is not None:
+                    state_dict[f"{mixer_prefix}.norm.weight"] = layer.mixer.norm.weight.data
+                    quant_state_dict[f"{mixer_prefix}.norm.weight"] = layer.mixer.norm.weight.data
+
+            elif layer_type == "-":  # MLP layer (no gate_proj, uses relu2)
+                get_state_dict(f"{mixer_prefix}.up_proj", 0, state_dict, layer.mixer.up_proj)
+                get_state_dict(f"{mixer_prefix}.down_proj", 0, state_dict, layer.mixer.down_proj)
+
+            elif layer_type == "E":  # MoE layer
+                # Gate
+                gate = layer.mixer.gate
+                get_state_dict(f"{mixer_prefix}.gate", 0, state_dict, gate, slice_weights=False)
+                if hasattr(gate, "e_score_correction_bias"):
+                    state_dict[f"{mixer_prefix}.gate.e_score_correction_bias"] = gate.e_score_correction_bias.data
+                    quant_state_dict[f"{mixer_prefix}.gate.e_score_correction_bias"] = gate.e_score_correction_bias.data
+
+                # Expert weights: SharedFusedMoE stores w13_weight (=up_proj for non-gated) and w2_weight (=down_proj)
+                experts = layer.mixer.experts
+                if hasattr(experts, "w13_weight"):
+                    state_dict[f"{mixer_prefix}.experts.up_proj"] = experts.w13_weight.data
+                    quant_state_dict[f"{mixer_prefix}.experts.up_proj"] = experts.w13_weight.data
+                if hasattr(experts, "w2_weight"):
+                    state_dict[f"{mixer_prefix}.experts.down_proj"] = experts.w2_weight.data
+                    quant_state_dict[f"{mixer_prefix}.experts.down_proj"] = experts.w2_weight.data
+
+                # Shared experts
+                if hasattr(layer.mixer, "shared_experts") and layer.mixer.shared_experts is not None:
+                    shared_prefix = f"{mixer_prefix}.shared_experts"
+                    get_state_dict(f"{shared_prefix}.up_proj", 0, state_dict, layer.mixer.shared_experts.up_proj)
+                    get_state_dict(f"{shared_prefix}.down_proj", 0, state_dict, layer.mixer.shared_experts.down_proj)
+
+                # Latent projections (optional)
+                if hasattr(layer.mixer, "fc1_latent_proj") and layer.mixer.fc1_latent_proj is not None:
+                    get_state_dict(f"{mixer_prefix}.fc1_latent_proj", 0, state_dict, layer.mixer.fc1_latent_proj, slice_weights=False)
+                if hasattr(layer.mixer, "fc2_latent_proj") and layer.mixer.fc2_latent_proj is not None:
+                    get_state_dict(f"{mixer_prefix}.fc2_latent_proj", 0, state_dict, layer.mixer.fc2_latent_proj, slice_weights=False)
+            pass
+
+            # Per-layer pre-norm (all Nemotron-H layer types have this)
+            try:
+                norm_weight = layer.norm.weight.data
+                norm_key = f"{vllm_text_model_prefix}.layers.{kk}.norm.weight"
+                state_dict[norm_key] = norm_weight
+                quant_state_dict[norm_key] = norm_weight
+            except Exception:
+                skipped_layernorms.append("norm")
+        pass
+    else:
+        for kk in range(len(vllm_text_model.layers)):
+            layer = vllm_text_model.layers[kk]
+            if hasattr(layer, "self_attn"):
+                prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
+                qkv_proj = layer.self_attn.qkv_proj
+                o_proj = layer.self_attn.o_proj
+
+                use_fused_qkv = _is_fused_module("qkv_proj")
+                if use_fused_qkv:
+                    # For some model types like phi3 vllm will expect fused qkv (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
+                    # so we should not split them here otherwise there will be a size mismatch when activating the adapter
+                    # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
+                    get_state_dict(f"{prefix}.qkv_proj", 0, state_dict, qkv_proj, slice_weights=False)
+                else:
+                    get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
+                    get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
+                    get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
+            elif hasattr(layer, "cross_attn"):
+                prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
+                qkv_proj = layer.cross_attn.qkv_proj
+                o_proj = layer.cross_attn.o_proj
+                name = re.sub(r"\.(\d+)\.", r"[\1].", prefix.replace('model.language_model','language_model.model', 1) + ".qkv_proj")
+                cross_attn_layer = eval(f'vllm_internals.{name}')
+                q_proj = cross_attn_layer.proj['q_proj_decoder']
+                kv_proj = cross_attn_layer.proj['kv_proj_encoder']
+                get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
+                get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
+                get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
+
+            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+
+            proj = layer.mlp.gate_up_proj
+            use_fused_gate_up = _is_fused_module("gate_up_proj")
+            if use_fused_gate_up:
+                # For some model types like phi3 vllm will expect fused gate_up_proj (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
                 # so we should not split them here otherwise there will be a size mismatch when activating the adapter
                 # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
-                get_state_dict(f"{prefix}.qkv_proj", 0, state_dict, qkv_proj, slice_weights=False)
+                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_up_proj", 0, state_dict, proj, slice_weights=False)
             else:
-                get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
-                get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
-                get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
-        elif hasattr(layer, "cross_attn"):
-            prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
-            qkv_proj = layer.cross_attn.qkv_proj
-            o_proj = layer.cross_attn.o_proj
-            name = re.sub(r"\.(\d+)\.", r"[\1].", prefix.replace('model.language_model','language_model.model', 1) + ".qkv_proj")
-            cross_attn_layer = eval(f'vllm_internals.{name}')
-            q_proj = cross_attn_layer.proj['q_proj_decoder']
-            kv_proj = cross_attn_layer.proj['kv_proj_encoder']
-            get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
-            get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
-            get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
+                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
+                get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
 
-        get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+            proj = layer.mlp.down_proj
+            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
 
-        proj = layer.mlp.gate_up_proj
-        use_fused_gate_up = _is_fused_module("gate_up_proj")
-        if use_fused_gate_up:
-            # For some model types like phi3 vllm will expect fused gate_up_proj (e.g. Phi3, Phi3.5-mini-instruct, Phi4-mini-instruct)
-            # so we should not split them here otherwise there will be a size mismatch when activating the adapter
-            # see https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
-            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_up_proj", 0, state_dict, proj, slice_weights=False)
-        else:
-            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.gate_proj", 0, state_dict, proj)
-            get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.up_proj",   1, state_dict, proj)
+            # Use layernorms from the layer configuration
+            layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
 
-        proj = layer.mlp.down_proj
-        get_state_dict(f"{vllm_text_model_prefix}.layers.{kk}.mlp.down_proj", 0, state_dict, proj)
-
-        # Use layernorms from the layer configuration
-        layernorm_names = [name.format(kk=kk) for name in layer_config['layernorms']]
-
-        for layernorm_name in layernorm_names:
-            vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].").replace(vllm_text_model_prefix, "vllm_text_model")
-            try:
-                layernorm = eval(vllm_name).state_dict()["weight"]
-                layernorm_name = f"{layernorm_name}.weight"
-                state_dict[layernorm_name] = layernorm
-                quant_state_dict[layernorm_name] = state_dict[layernorm_name]
-            except Exception as e:
-                skipped_layernorms.append(layernorm_name.split(".")[-1])
+            for layernorm_name in layernorm_names:
+                vllm_name = layernorm_name.replace(f".{kk}.", f"[{kk}].").replace(vllm_text_model_prefix, "vllm_text_model")
+                try:
+                    layernorm = eval(vllm_name).state_dict()["weight"]
+                    layernorm_name = f"{layernorm_name}.weight"
+                    state_dict[layernorm_name] = layernorm
+                    quant_state_dict[layernorm_name] = state_dict[layernorm_name]
+                except Exception as e:
+                    skipped_layernorms.append(layernorm_name.split(".")[-1])
+            pass
         pass
     pass
 
@@ -1158,11 +1280,17 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     if is_vision_model:
         # Handle vision-specific layers using dedicated functions
         extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
+
     # Norm
-    # For Gemma3 and similar multimodal models, norm should be under model.norm
-    # For standard models, also under model.norm
-    norm_prefix = f"{vllm_text_model_prefix}.norm.weight"
-    state_dict[norm_prefix] = vllm_text_model.norm.weight.data
+    if is_nemotron_h:
+        # Nemotron-H uses norm_f instead of norm
+        norm_prefix = f"{vllm_text_model_prefix}.norm_f.weight"
+        state_dict[norm_prefix] = vllm_text_model.norm_f.weight.data
+    else:
+        # For Gemma3 and similar multimodal models, norm should be under model.norm
+        # For standard models, also under model.norm
+        norm_prefix = f"{vllm_text_model_prefix}.norm.weight"
+        state_dict[norm_prefix] = vllm_text_model.norm.weight.data
     quant_state_dict[norm_prefix] = state_dict[norm_prefix]
 
     # LM Head - Use get_state_dict for consistency
@@ -1172,7 +1300,10 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         get_state_dict("lm_head", 0, state_dict, lm_layer[0], slice_weights=False)
     else:
         # Fallback to embed_tokens for tied embeddings
-        embed_key = f"{vllm_text_model_prefix}.embed_tokens.weight"
+        if is_nemotron_h:
+            embed_key = f"{vllm_text_model_prefix}.embeddings.weight"
+        else:
+            embed_key = f"{vllm_text_model_prefix}.embed_tokens.weight"
         if embed_key in state_dict:
             lm_weight = state_dict[embed_key]
             state_dict["lm_head.weight"] = lm_weight
@@ -1309,6 +1440,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     pass
 
     skipped_layernorms = []
+    model_type = getattr(config, "model_type", "")
     for kk in range(layer_count):
         for layer_name in layer_names:
             layer_name = layer_name.format(kk = kk)
@@ -1316,6 +1448,11 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             if 'language_model.model' in layer_name:
                 # vLLM uses vllm_internals.language_model.model.layers while HF uses model.language_model.layers
                 layer_name = layer_name.replace('language_model.model', 'language_model')
+
+            if model_type == "nemotron_h" and layer_name.startswith("model."):
+                target_layer_name = "backbone." + layer_name[len("model."):]
+            else:
+                target_layer_name = layer_name
 
             is_weight = True
             if layer_name in quant_state_dict:
@@ -1352,7 +1489,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
             if layer_name in quant_state_dict:
                 # for attributes of type nn.Parameter, there's no .weight
-                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name.replace('model.','',1))
+                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", target_layer_name)
                 layer = torch.nn.Parameter(weight, requires_grad = False)
                 exec(f"new_model.{layer_name_br} = layer")
                 continue
@@ -1407,7 +1544,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             else:
                 # LayerNorms (including vision norms)
                 weight_param = torch.nn.Parameter(weight, requires_grad=False)
-                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name)
+                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", target_layer_name)
                 # Set weight
                 exec(f"new_model.{layer_name_br}.weight = None")
                 exec(f"new_model.{layer_name_br}.weight = weight_param")
@@ -1419,8 +1556,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             pass
 
             # Convert model.layers.0.self_attn.q_proj to model.layers[0].self_attn.q_proj
-            layer_name = re.sub(r"\.([\d]{1,})", lambda x: f"[{x.group(1)}]", layer_name)
-            exec(f"new_model.{layer_name} = layer")
+            target_layer_name = re.sub(r"\.([\d]{1,})", lambda x: f"[{x.group(1)}]", target_layer_name)
+            exec(f"new_model.{target_layer_name} = layer")
         pass
     pass
 
@@ -1764,6 +1901,9 @@ def load_vllm(
     return_args            : bool = False, # Just return args
     max_num_seqs           : int = 256, # how many seqs to process in parallel. Default vLLM 256
     fp8_mode               : Optional[str] = None,
+    trust_remote_code      : bool = True,
+    revision               = None,
+    token                  = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Create vLLM instance
@@ -2194,8 +2334,42 @@ def load_vllm(
             print(f"Unsloth: FAILED getting compilation_config with error = {str(e)}")
     pass
 
+    tokenizer_name = model_name
+    _needs_tokenizer_override = False
+    try:
+        from huggingface_hub import hf_hub_download
+
+        tokenizer_config_file = hf_hub_download(
+            repo_id = model_name,
+            filename = "tokenizer_config.json",
+            revision = revision,
+            token = token,
+        )
+        with open(tokenizer_config_file, "r", encoding = "utf-8") as f:
+            tokenizer_config = json.load(f)
+        _needs_tokenizer_override = tokenizer_config.get("tokenizer_class", "") == "TokenizersBackend"
+    except Exception:
+        local_tokenizer_config = os.path.join(model_name, "tokenizer_config.json")
+        if os.path.exists(local_tokenizer_config):
+            try:
+                with open(local_tokenizer_config, "r", encoding = "utf-8") as f:
+                    tokenizer_config = json.load(f)
+                _needs_tokenizer_override = tokenizer_config.get("tokenizer_class", "") == "TokenizersBackend"
+            except Exception:
+                pass
+    if _needs_tokenizer_override:
+        overridden_tokenizer = _maybe_create_vllm_tokenizer_override(
+            model_name,
+            token = token,
+            revision = revision,
+            trust_remote_code = trust_remote_code,
+        )
+        if overridden_tokenizer is not None:
+            tokenizer_name = overridden_tokenizer
+
     engine_args = dict(
         model                  = model_name,
+        tokenizer              = tokenizer_name,
         gpu_memory_utilization = actual_gpu_memory_utilization,
         max_model_len          = max_seq_length,
         quantization           = "bitsandbytes" if use_bitsandbytes else None,
@@ -2225,6 +2399,7 @@ def load_vllm(
         # New vLLM versions need to pass this in!
         # worker_extension_cls   = "unsloth_zoo.vllm_rlhf_utils.ColocateWorkerExtension",
         enable_sleep_mode      = unsloth_vllm_standby,
+        trust_remote_code      = trust_remote_code,
     )
     if is_vision_model:
         # To reduce memory usage, we limit the number of images/videos per prompt
@@ -2355,6 +2530,8 @@ def load_vllm(
     pass
     # Save maximum requests length since llm.generate fails to partition inputs sometimes
     llm.approx_max_num_seqs = approx_max_num_seqs
+    if tokenizer_name != model_name:
+        llm._unsloth_temp_tokenizer_dir = tokenizer_name
 
     # Unpatch vLLM compute_dtype for bitsandbytes
     unpatch_vllm_compute_dtype(BitsAndBytesConfig)
